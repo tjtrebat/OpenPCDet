@@ -6,7 +6,7 @@ All Rights Reserved 2019-2020.
 import torch
 
 from ...utils import common_utils
-from . import iou3d_nms_cuda
+#from . import iou3d_nms_cuda
 
 
 def boxes_bev_iou_cpu(boxes_a, boxes_b):

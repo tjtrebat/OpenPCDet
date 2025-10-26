@@ -1,5 +1,5 @@
 DATASET: 'KittiDataset'
-DATA_PATH: '/projects/bfqr/ttrebat/kitti'
+DATA_PATH: '/home/tom/kitti'
 
 POINT_CLOUD_RANGE: [0, -40, -3, 70.4, 40, 1]
 
@@ -9,8 +9,8 @@ DATA_SPLIT: {
 }
 
 INFO_PATH: {
-    'train': ['kitti_infos/kitti_infos_train.pkl'],
-    'test': ['kitti_infos/kitti_infos_val.pkl'],
+    'train': [kitti_infos/kitti_infos_train.pkl],
+    'test': [kitti_infos/kitti_infos_val.pkl],
 }
 
 GET_ITEM_LIST: ["points"]

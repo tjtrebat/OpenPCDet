@@ -14,12 +14,14 @@ INFO_PATH: {
 }
 
 GET_ITEM_LIST: ["points"]
+#GET_ITEM_LIST: ["points", "images", "gt_boxes2d"]
 FOV_POINTS_ONLY: True
 
 DATA_AUGMENTOR:
     DISABLE_AUG_LIST: ['placeholder']
     AUG_CONFIG_LIST:
         - NAME: gt_sampling
+          #IMG_AUG_TYPE: kitti
           USE_ROAD_PLANE: True
           DB_INFO_PATH:
               - kitti_infos/kitti_dbinfos_train.pkl

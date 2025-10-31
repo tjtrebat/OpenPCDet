@@ -22,6 +22,9 @@ done
 echo $PORT
 
 srun -p ${PARTITION} \
+    --account=bfqr-dtai-gh \
+    --time=02:00:00 \
+    --mem=128g \
     --job-name=${JOB_NAME} \
     --gres=gpu:${GPUS_PER_NODE} \
     --ntasks=${GPUS} \
@@ -29,4 +32,4 @@ srun -p ${PARTITION} \
     --cpus-per-task=${CPUS_PER_TASK} \
     --kill-on-bad-exit=1 \
     ${SRUN_ARGS} \
-    python -u train.py --launcher slurm --tcp_port $PORT ${PY_ARGS}
+    bash -c "source ~/openpcdet_env/bin/activate; python -u train.py --launcher slurm --tcp_port $PORT ${PY_ARGS}"

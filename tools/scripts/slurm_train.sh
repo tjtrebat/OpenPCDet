@@ -23,8 +23,8 @@ echo $PORT
 
 srun -p ${PARTITION} \
     --account=bfqr-dtai-gh \
-    --time=02:00:00 \
-    --mem=128g \
+    --time=04:00:00 \
+    --mem=64g \
     --job-name=${JOB_NAME} \
     --gres=gpu:${GPUS_PER_NODE} \
     --ntasks=${GPUS} \

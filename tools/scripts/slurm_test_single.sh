@@ -10,6 +10,7 @@ JOB_NAME=eval
 SRUN_ARGS=${SRUN_ARGS:-""}
 
 srun -p ${PARTITION} \
+    --account=bfqr-dtai-gh \
     --job-name=${JOB_NAME} \
     --gres=gpu:${GPUS_PER_NODE} \
     --ntasks=${GPUS} \

@@ -202,7 +202,17 @@ class DatasetTemplate(torch_data.Dataset):
             if data_dict.get('gt_boxes2d', None) is not None:
                 data_dict['gt_boxes2d'] = data_dict['gt_boxes2d'][selected]
 
-        if data_dict.get('points', None) is not None:
+        if data_dict.get('points', None) is not None:            
+            if data_dict.get('gt_boxes', None) is not None:
+                points = data_dict['points']
+                gt_boxes = data_dict['gt_boxes']
+                sem_labels, inst_labels = self.assign_point_labels(points, gt_boxes)
+                num_classes = len(self.class_names)
+                one_hot_sem = np.zeros((points.shape[0], num_classes), dtype=np.float32)
+                valid = sem_labels > 0
+                one_hot_sem[valid, sem_labels[valid] - 1] = 1.0
+                points = np.concatenate([points, one_hot_sem, inst_labels[:, None]], axis=1)
+                data_dict["points"] = points
             data_dict = self.point_feature_encoder.forward(data_dict)
 
         data_dict = self.data_processor.forward(
@@ -216,6 +226,66 @@ class DatasetTemplate(torch_data.Dataset):
         data_dict.pop('gt_names', None)
 
         return data_dict
+
+    def assign_point_labels(self, points, gt_boxes):
+        """
+        points:     (N, 3+C)
+        gt_boxes:   (M, 7)  [x, y, z, dx, dy, dz, heading, class_id]
+
+        Returns:
+            sem_labels:  (N,) int32   semantic class per point
+            inst_labels: (N,) int32   instance ID per point (0 = background)
+        """
+        N = points.shape[0]
+        M = gt_boxes.shape[0]
+
+        xyz = points[:, :3]
+        sem_labels = np.zeros(N, dtype=np.int32)
+        inst_labels = np.zeros(N, dtype=np.int32)
+
+        if M == 0:
+            return sem_labels, inst_labels
+
+        cx = gt_boxes[:, 0]
+        cy = gt_boxes[:, 1]
+        cz = gt_boxes[:, 2]
+        dx = gt_boxes[:, 3]
+        dy = gt_boxes[:, 4]
+        dz = gt_boxes[:, 5]
+        heading = gt_boxes[:, 6]
+        gt_classes = gt_boxes[:, 7]
+
+        hx = dx / 2
+        hy = dy / 2
+        hz = dz / 2
+
+        X = xyz[:, 0][None, :] - cx[:, None]
+        Y = xyz[:, 1][None, :] - cy[:, None]
+        Z = xyz[:, 2][None, :] - cz[:, None]
+
+        cos_h = np.cos(heading)[:, None]
+        sin_h = np.sin(heading)[:, None]
+
+        local_x =  X*cos_h + Y*sin_h
+        local_y = -X*sin_h + Y*cos_h
+        local_z =  Z
+
+        mask = (
+            (np.abs(local_x) <= hx[:, None]) &
+            (np.abs(local_y) <= hy[:, None]) &
+            (np.abs(local_z) <= hz[:, None])
+        )   # (M, N)
+
+        for box_idx in range(M):
+            pts = mask[box_idx]  # (N,)
+            if not np.any(pts):
+                continue
+
+            sem_labels[pts] = gt_classes[box_idx]
+            inst_labels[pts] = box_idx + 1
+
+        return sem_labels, inst_labels
+
 
     @staticmethod
     def collate_batch(batch_list, _unused=False):

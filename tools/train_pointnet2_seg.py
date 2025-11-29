@@ -93,12 +93,18 @@ def train_one_epoch(model, loader, optimizer, device):
 cfg_from_yaml_file('cfgs/dataset_configs/kitti_dataset.yaml', cfg)
 cfg.DATA_PROCESSOR = [{
     'NAME': 'mask_points_and_boxes_outside_range',
-    'REMOVE_OUTSIDE_BOXES': True
+    'REMOVE_OUTSIDE_BOXES': False
 }, {
     'NAME': 'sample_points',
     'NUM_POINTS': {
-        'train': 16384,
-        'test': 16384
+        'train': 20000,
+        'test': 20000
+    }
+}, {
+    'NAME': 'shuffle_points',
+    'SHUFFLE_ENABLED': {
+        'train': True,
+        'test': False
     }
 }]
 

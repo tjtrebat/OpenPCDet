@@ -1,9 +1,16 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
 import numpy as np
+
+from pathlib import Path
+from easydict import EasyDict as edict
 
 from torch.utils.data import Dataset, DataLoader
 
 from pcdet.config import cfg, cfg_from_yaml_file
 from pcdet.datasets.kitti.kitti_dataset import KittiDataset
+from pcdet.models.backbones_3d.pointnet2_backbone import PointNet2MSG
 
 
 class PointSegDataset(Dataset):
@@ -17,25 +24,137 @@ class PointSegDataset(Dataset):
         sample = self.kitti_dataset[idx]
         points = sample['points'][:, :4]        
         N = points.shape[0]
-        sem_labels = np.zeros(N, dtype=np.int32)
+        labels = np.zeros(N, dtype=np.int32)
         one_hot_labels = sample['points'][:, 4:7]
         foreground_mask = np.any(one_hot_labels, axis=1)
-        sem_labels[foreground_mask] = np.argmax(one_hot_labels[foreground_mask], axis=1) + 1
-        return points, sem_labels
+        labels[foreground_mask] = np.argmax(one_hot_labels[foreground_mask], axis=1) + 1
+        return points.astype('float32'), labels.astype('int64')
 
 
-cfg_from_yaml_file('tools/cfgs/dataset_configs/kitti_dataset.yaml', cfg)
+def collate_fn(batch):
+    batch_points = []
+    batch_labels = []
+    for b_idx, (pts, lbls) in enumerate(batch):
+        N = pts.shape[0]
+        batch_col = torch.full((N,1), b_idx, dtype=torch.float32)
+        batch_points.append(torch.cat([batch_col, torch.from_numpy(pts)], dim=1))
+        batch_labels.append(torch.from_numpy(lbls))
+
+    return {
+        'batch_size': len(batch),
+        'points': torch.cat(batch_points, dim=0),
+        'labels': torch.cat(batch_labels, dim=0),
+    }
+
+
+class PointNet2Seg(nn.Module):
+    def __init__(self, model_cfg, input_channels, num_classes):
+        super().__init__()
+        self.backbone = PointNet2MSG(model_cfg, input_channels=input_channels)
+        feat_dim = self.backbone.num_point_features
+        self.classifier = nn.Sequential(
+            nn.Linear(feat_dim, feat_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(feat_dim, num_classes),
+        )
+
+    def forward(self, batch_dict):
+        batch_dict = self.backbone(batch_dict)
+        point_features = batch_dict['point_features']     # (total_points, C)
+        logits = self.classifier(point_features)          # (total_points, num_classes)
+        batch_dict['logits'] = logits
+        return batch_dict
+
+
+def train_one_epoch(model, loader, optimizer, device):
+    model.train()
+    total_loss = 0
+
+    for batch_dict in loader:
+        for k in batch_dict:
+            if isinstance(batch_dict[k], torch.Tensor):
+                batch_dict[k] = batch_dict[k].to(device)
+
+        out_dict = model(batch_dict)
+        logits = out_dict['logits']        # (M, num_classes)
+        labels = batch_dict['labels']      # (M,)
+
+        loss = nn.functional.cross_entropy(logits, labels)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+
+    return total_loss / len(loader)
+
+
+cfg_from_yaml_file('cfgs/dataset_configs/kitti_dataset.yaml', cfg)
 cfg.DATA_PROCESSOR = [{
     'NAME': 'mask_points_and_boxes_outside_range',
     'REMOVE_OUTSIDE_BOXES': True
+}, {
+    'NAME': 'sample_points',
+    'NUM_POINTS': {
+        'train': 16384,
+        'test': 16384
+    }
 }]
+
 class_names = ['Car', 'Pedestrian', 'Cyclist']
 kitti_dataset = KittiDataset(cfg, class_names, training=True)
+train_set = PointSegDataset(kitti_dataset)
+train_loader = DataLoader(
+    train_set,
+    batch_size=4,
+    collate_fn=collate_fn,
+    shuffle=True,
+    num_workers=4,
+    pin_memory=True
+)
 
-dataset = PointSegDataset(kitti_dataset)
-points, labels = dataset[0]
-print(points.shape, labels.shape)
-print('Background Points:', len(labels[labels == 0]))
-print('Car Points:', len(labels[labels == 1]))
-print('Pedestrian Points:', len(labels[labels == 2]))
-print('Cyclist Points:', len(labels[labels == 3]))
+model_cfg = {
+    'SA_CONFIG': {
+        'NPOINTS':   [4096, 1024, 256],
+        'RADIUS':    [[0.1, 0.2], [0.2, 0.4], [0.4, 0.8]],
+        'NSAMPLE':   [[16, 32],  [32, 64],  [64, 128]],
+        'MLPS':      [
+            [[32, 32, 64], [64, 64, 128]],
+            [[64, 64, 128], [128, 128, 256]],
+            [[128, 128, 256], [256, 256, 512]]
+        ],
+        'USE_XYZ': True,
+    },
+    'FP_MLPS': [
+        [128, 128],
+        [256, 256],
+        [256, 256]
+    ]
+}
+model_cfg = edict(model_cfg)
+
+num_classes = 4
+input_channels = 3 + 1  # x,y,z + reflectance OR x,y,z,feat...
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+model = PointNet2Seg(model_cfg, input_channels, num_classes).to(device)
+optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-2)
+
+max_epochs = 50
+ckpt_path = Path('/u/ttrebat/OpenPCDet/output/kitti_models/pointnet2_seg/ckpt')
+
+for epoch in range(1, max_epochs + 1):
+    loss = train_one_epoch(model, train_loader, optimizer, device)
+    print(f"[Epoch {epoch:03d}] Loss: {loss:.4f}")
+
+    save_path = ckpt_path / f'checkpoint_epoch_{epoch}.pth'
+
+    torch.save({
+        'epoch': epoch,
+        'model_state': model.state_dict(),
+        'optimizer_state': optimizer.state_dict()
+    }, save_path)
+
+    print(f"  → saved checkpoint at {save_path}")

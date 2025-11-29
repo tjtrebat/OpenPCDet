@@ -207,10 +207,11 @@ class DatasetTemplate(torch_data.Dataset):
                 points = data_dict['points']
                 gt_boxes = data_dict['gt_boxes']
                 sem_labels, inst_labels = self.assign_point_labels(points, gt_boxes)
-                num_classes = len(self.class_names)
+                num_classes = len(self.class_names) + 1
                 one_hot_sem = np.zeros((points.shape[0], num_classes), dtype=np.float32)
                 valid = sem_labels > 0
-                one_hot_sem[valid, sem_labels[valid] - 1] = 1.0
+                one_hot_sem[valid, sem_labels[valid]] = 1.0
+                one_hot_sem[~valid, 0] = 1.0
                 points = np.concatenate([points, one_hot_sem, inst_labels[:, None]], axis=1)
                 data_dict["points"] = points
             data_dict = self.point_feature_encoder.forward(data_dict)

@@ -1,16 +1,31 @@
+import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.distributed as dist
 import numpy as np
 
 from pathlib import Path
 from easydict import EasyDict as edict
 
-from torch.utils.data import Dataset, DataLoader
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import Dataset, DataLoader, DistributedSampler
 
 from pcdet.config import cfg, cfg_from_yaml_file
 from pcdet.datasets.kitti.kitti_dataset import KittiDataset
 from pcdet.models.backbones_3d.pointnet2_backbone import PointNet2MSG
+
+
+def init_distributed():
+    if "RANK" not in os.environ:
+        print("Running in single-GPU mode.")
+        return None, torch.device("cuda")
+
+    dist.init_process_group(backend='nccl', init_method='env://')
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    device = torch.device(f"cuda:{local_rank}")
+    return dist.get_rank(), device
 
 
 class PointSegDataset(Dataset):
@@ -90,77 +105,90 @@ def train_one_epoch(model, loader, optimizer, device):
     return total_loss / len(loader)
 
 
-cfg_from_yaml_file('cfgs/dataset_configs/kitti_dataset.yaml', cfg)
-cfg.DATA_PROCESSOR = [{
-    'NAME': 'mask_points_and_boxes_outside_range',
-    'REMOVE_OUTSIDE_BOXES': False
-}, {
-    'NAME': 'sample_points',
-    'NUM_POINTS': {
-        'train': 20000,
-        'test': 20000
-    }
-}, {
-    'NAME': 'shuffle_points',
-    'SHUFFLE_ENABLED': {
-        'train': True,
-        'test': False
-    }
-}]
+def main():
+    rank, device = init_distributed()
+    is_main = (rank is None) or (rank == 0)
 
-class_names = ['Car', 'Pedestrian', 'Cyclist']
-kitti_dataset = KittiDataset(cfg, class_names, training=True)
-train_set = PointSegDataset(kitti_dataset)
-train_loader = DataLoader(
-    train_set,
-    batch_size=4,
-    collate_fn=collate_fn,
-    shuffle=True,
-    num_workers=4,
-    pin_memory=True
-)
-
-model_cfg = {
-    'SA_CONFIG': {
-        'NPOINTS':   [4096, 1024, 256],
-        'RADIUS':    [[0.1, 0.2], [0.2, 0.4], [0.4, 0.8]],
-        'NSAMPLE':   [[16, 32],  [32, 64],  [64, 128]],
-        'MLPS':      [
-            [[32, 32, 64], [64, 64, 128]],
-            [[64, 64, 128], [128, 128, 256]],
-            [[128, 128, 256], [256, 256, 512]]
-        ],
-        'USE_XYZ': True,
-    },
-    'FP_MLPS': [
-        [128, 128],
-        [256, 256],
-        [256, 256]
+    cfg_from_yaml_file('cfgs/dataset_configs/kitti_dataset.yaml', cfg)
+    cfg.DATA_PROCESSOR = [
+        {'NAME': 'mask_points_and_boxes_outside_range', 'REMOVE_OUTSIDE_BOXES': False}, 
+        {'NAME': 'sample_points', 'NUM_POINTS': {'train': 20000, 'test': 20000}}, 
+        {'NAME': 'shuffle_points', 'SHUFFLE_ENABLED': {'train': True, 'test': False}}
     ]
-}
-model_cfg = edict(model_cfg)
 
-num_classes = 4
-input_channels = 3 + 1  # x,y,z + reflectance OR x,y,z,feat...
+    class_names = ['Car', 'Pedestrian', 'Cyclist']
+    kitti_dataset = KittiDataset(cfg, class_names, training=True)
+    train_set = PointSegDataset(kitti_dataset)
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if rank is not None:
+        train_sampler = DistributedSampler(train_set, shuffle=True)
+    else:
+        train_sampler = None
+    
+    train_loader = DataLoader(
+        train_set,
+        batch_size=4,
+        collate_fn=collate_fn,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
+        num_workers=4,
+        pin_memory=True,
+        drop_last=True
+    )
 
-model = PointNet2Seg(model_cfg, input_channels, num_classes).to(device)
-optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-2)
+    model_cfg = {
+        'SA_CONFIG': {
+            'NPOINTS':   [4096, 1024, 256],
+            'RADIUS':    [[0.1, 0.2], [0.2, 0.4], [0.4, 0.8]],
+            'NSAMPLE':   [[16, 32],  [32, 64],  [64, 128]],
+            'MLPS':      [
+                [[32, 32, 64], [64, 64, 128]],
+                [[64, 64, 128], [128, 128, 256]],
+                [[128, 128, 256], [256, 256, 512]]
+            ],
+            'USE_XYZ': True,
+        },
+        'FP_MLPS': [
+            [128, 128],
+            [256, 256],
+            [256, 256]
+        ]
+    }
+    model_cfg = edict(model_cfg)
 
-max_epochs = 50
-ckpt_path = Path('/u/ttrebat/OpenPCDet/output/kitti_models/pointnet2_seg/ckpt')
+    num_classes = 4
+    input_channels = 3 + 1  # x,y,z + reflectance
 
-for epoch in range(1, max_epochs + 1):
-    loss = train_one_epoch(model, train_loader, optimizer, device)
-    print(f"[Epoch {epoch:03d}] Loss: {loss:.4f}")
+    model = PointNet2Seg(model_cfg, input_channels, num_classes).to(device)
 
-    save_path = ckpt_path / f'checkpoint_epoch_{epoch}.pth'
+    if rank is not None:
+        model = DDP(model, device_ids=[device], output_device=device)
 
-    torch.save({
-        'epoch': epoch,
-        'model_state': model.state_dict(),
-        'optimizer_state': optimizer.state_dict()
-    }, save_path)
+    optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-2)
 
-    print(f"  → saved checkpoint at {save_path}")
+    max_epochs = 50
+    ckpt_path = Path('/u/ttrebat/OpenPCDet/output/kitti_models/pointnet2_seg/ckpt')
+    ckpt_path.mkdir(parents=True, exist_ok=True)
+
+    for epoch in range(1, max_epochs + 1):
+        if rank is not None:
+            train_loader.sampler.set_epoch(epoch)
+                
+        loss = train_one_epoch(model, train_loader, optimizer, device)
+
+        if is_main:
+            print(f"[Epoch {epoch:03d}] Loss: {loss:.4f}")
+            save_path = ckpt_path / f'checkpoint_epoch_{epoch}.pth'
+            torch.save({
+                'epoch': epoch,
+                'model_state': model.module.state_dict() if rank is not None else model.state_dict(),
+                'optimizer_state': optimizer.state_dict()
+            }, save_path)
+            print(f"  → saved checkpoint at {save_path}")
+
+    if rank is not None:
+        dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()

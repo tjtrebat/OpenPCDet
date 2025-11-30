@@ -3,17 +3,16 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.distributed as dist
-import numpy as np
 
 from pathlib import Path
-from easydict import EasyDict as edict
 
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import Dataset, DataLoader, DistributedSampler
+from torch.utils.data import DataLoader, DistributedSampler
 
 from pcdet.config import cfg, cfg_from_yaml_file
 from pcdet.datasets.kitti.kitti_dataset import KittiDataset
-from pcdet.models.backbones_3d.pointnet2_backbone import PointNet2MSG
+from pcdet.models.pointnet2_seg import PointNet2Seg
+from pcdet.datasets.point_seg_dataset import PointSegDataset
 
 
 def init_distributed():
@@ -26,24 +25,6 @@ def init_distributed():
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
     return dist.get_rank(), device
-
-
-class PointSegDataset(Dataset):
-    def __init__(self, kitti_dataset):
-        self.kitti_dataset = kitti_dataset
-
-    def __len__(self):
-        return len(self.kitti_dataset)
-
-    def __getitem__(self, idx):
-        sample = self.kitti_dataset[idx]
-        points = sample['points'][:, :4]        
-        N = points.shape[0]
-        labels = np.zeros(N, dtype=np.int32)
-        one_hot_labels = sample['points'][:, 4:7]
-        foreground_mask = np.any(one_hot_labels, axis=1)
-        labels[foreground_mask] = np.argmax(one_hot_labels[foreground_mask], axis=1) + 1
-        return points.astype('float32'), labels.astype('int64')
 
 
 def collate_fn(batch):
@@ -60,25 +41,6 @@ def collate_fn(batch):
         'points': torch.cat(batch_points, dim=0),
         'labels': torch.cat(batch_labels, dim=0),
     }
-
-
-class PointNet2Seg(nn.Module):
-    def __init__(self, model_cfg, input_channels, num_classes):
-        super().__init__()
-        self.backbone = PointNet2MSG(model_cfg, input_channels=input_channels)
-        feat_dim = self.backbone.num_point_features
-        self.classifier = nn.Sequential(
-            nn.Linear(feat_dim, feat_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(feat_dim, num_classes),
-        )
-
-    def forward(self, batch_dict):
-        batch_dict = self.backbone(batch_dict)
-        point_features = batch_dict['point_features']     # (total_points, C)
-        logits = self.classifier(point_features)          # (total_points, num_classes)
-        batch_dict['logits'] = logits
-        return batch_dict
 
 
 def train_one_epoch(model, loader, optimizer, device):
@@ -136,25 +98,7 @@ def main():
         drop_last=True
     )
 
-    model_cfg = {
-        'SA_CONFIG': {
-            'NPOINTS':   [4096, 1024, 256],
-            'RADIUS':    [[0.1, 0.2], [0.2, 0.4], [0.4, 0.8]],
-            'NSAMPLE':   [[16, 32],  [32, 64],  [64, 128]],
-            'MLPS':      [
-                [[32, 32, 64], [64, 64, 128]],
-                [[64, 64, 128], [128, 128, 256]],
-                [[128, 128, 256], [256, 256, 512]]
-            ],
-            'USE_XYZ': True,
-        },
-        'FP_MLPS': [
-            [128, 128],
-            [256, 256],
-            [256, 256]
-        ]
-    }
-    model_cfg = edict(model_cfg)
+    model_cfg = cfg.SEMANTIC_SEGMENTATION.MODEL_CFG
 
     num_classes = 4
     input_channels = 3 + 1  # x,y,z + reflectance

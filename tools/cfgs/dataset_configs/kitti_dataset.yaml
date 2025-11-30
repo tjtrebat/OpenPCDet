@@ -16,6 +16,21 @@ INFO_PATH: {
 GET_ITEM_LIST: ["points"]
 FOV_POINTS_ONLY: True
 
+USE_PREDICTED_SEMANTICS: True
+
+SEMANTIC_SEGMENTATION:
+    MODEL_CFG:
+        SA_CONFIG:
+            NPOINTS: [4096, 1024, 256]
+            RADIUS: [[0.1, 0.2], [0.2, 0.4], [0.4, 0.8]]
+            NSAMPLE: [[16, 32], [32, 64], [64, 128]]
+            MLPS: [[[32, 32, 64], [64, 64, 128]], [[64, 64, 128], [128, 128, 256]], [[128, 128, 256], [256, 256, 512]]]
+            USE_XYZ: True
+
+        FP_MLPS: [[128, 128], [256, 256], [256, 256]]
+
+    CKPT_PATH: "/u/ttrebat/OpenPCDet/output/kitti_models/pointnet2_seg/ckpt/checkpoint_epoch_50.pth"
+
 DATA_AUGMENTOR:
     DISABLE_AUG_LIST: ['placeholder']
     AUG_CONFIG_LIST:

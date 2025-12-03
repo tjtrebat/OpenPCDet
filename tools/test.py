@@ -16,6 +16,7 @@ from pcdet.config import cfg, cfg_from_list, cfg_from_yaml_file, log_config_to_f
 from pcdet.datasets import build_dataloader
 from pcdet.models import build_network
 from pcdet.utils import common_utils
+from pcdet.models.pointnet2_seg import PointNet2Seg
 
 
 def parse_config():
@@ -55,7 +56,7 @@ def parse_config():
     return args, cfg
 
 
-def eval_single_ckpt(model, test_loader, args, eval_output_dir, logger, epoch_id, dist_test=False):
+def eval_single_ckpt(model, test_loader, args, eval_output_dir, logger, epoch_id, dist_test=False, seg_model=None):
     # load checkpoint
     model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=dist_test, 
                                 pre_trained_path=args.pretrained_model)
@@ -64,7 +65,7 @@ def eval_single_ckpt(model, test_loader, args, eval_output_dir, logger, epoch_id
     # start evaluation
     eval_utils.eval_one_epoch(
         cfg, args, model, test_loader, epoch_id, logger, dist_test=dist_test,
-        result_dir=eval_output_dir
+        result_dir=eval_output_dir, seg_model=seg_model
     )
 
 
@@ -86,7 +87,7 @@ def get_no_evaluated_ckpt(ckpt_dir, ckpt_record_file, args):
     return -1, None
 
 
-def repeat_eval_ckpt(model, test_loader, args, eval_output_dir, logger, ckpt_dir, dist_test=False):
+def repeat_eval_ckpt(model, test_loader, args, eval_output_dir, logger, ckpt_dir, dist_test=False, seg_model=None):
     # evaluated ckpt record
     ckpt_record_file = eval_output_dir / ('eval_list_%s.txt' % cfg.DATA_CONFIG.DATA_SPLIT['test'])
     with open(ckpt_record_file, 'a'):
@@ -122,7 +123,7 @@ def repeat_eval_ckpt(model, test_loader, args, eval_output_dir, logger, ckpt_dir
         cur_result_dir = eval_output_dir / ('epoch_%s' % cur_epoch_id) / cfg.DATA_CONFIG.DATA_SPLIT['test']
         tb_dict = eval_utils.eval_one_epoch(
             cfg, args, model, test_loader, cur_epoch_id, logger, dist_test=dist_test,
-            result_dir=cur_result_dir
+            result_dir=cur_result_dir, seg_model=seg_model
         )
 
         if cfg.LOCAL_RANK == 0:
@@ -199,11 +200,24 @@ def main():
     )
 
     model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=test_set)
+
+    seg_model = None
+    if cfg.DATA_CONFIG.get('POINTNET2_SEG', {}).get('ENABLE', False):
+        logger.info("Initializing PointNet2 segmentation model")
+        seg_cfg = cfg.DATA_CONFIG.POINTNET2_SEG.MODEL_CFG
+        seg_ckpt = cfg.DATA_CONFIG.POINTNET2_SEG.CKPT
+        num_classes = cfg.DATA_CONFIG.POINTNET2_SEG.NUM_CLASSES
+        input_channels = 4
+        seg_model = PointNet2Seg(seg_cfg, input_channels, num_classes).cuda()
+        seg_model.load_state_dict(torch.load(seg_ckpt, map_location='cuda')['model_state'])
+        seg_model.eval()
+        logger.info(f"Loaded segmentation model from {seg_ckpt}")
+
     with torch.no_grad():
         if args.eval_all:
-            repeat_eval_ckpt(model, test_loader, args, eval_output_dir, logger, ckpt_dir, dist_test=dist_test)
+            repeat_eval_ckpt(model, test_loader, args, eval_output_dir, logger, ckpt_dir, dist_test=dist_test, seg_model=seg_model)
         else:
-            eval_single_ckpt(model, test_loader, args, eval_output_dir, logger, epoch_id, dist_test=dist_test)
+            eval_single_ckpt(model, test_loader, args, eval_output_dir, logger, epoch_id, dist_test=dist_test, seg_model=seg_model)
 
 
 if __name__ == '__main__':

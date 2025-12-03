@@ -4,7 +4,6 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.utils.data as torch_data
-from sklearn.cluster import DBSCAN
 
 from ..utils import common_utils
 from .augmentor.data_augmentor import DataAugmentor
@@ -47,21 +46,6 @@ class DatasetTemplate(torch_data.Dataset):
             self.depth_downsample_factor = self.data_processor.depth_downsample_factor
         else:
             self.depth_downsample_factor = None
-
-        self.use_predicted_semantics = getattr(self.dataset_cfg, 'USE_PREDICTED_SEMANTICS', False)
-        if self.use_predicted_semantics:
-            self.semseg_cfg = dataset_cfg.SEMANTIC_SEGMENTATION
-            self._init_segmentation_model()
-
-    def _init_segmentation_model(self):
-        model_cfg = self.semseg_cfg.MODEL_CFG
-        ckpt_path = self.semseg_cfg.CKPT_PATH
-        num_classes = len(self.class_names) + 1
-        input_channels = 4  # x, y, z, intensity
-        self.seg_model = PointNet2Seg(model_cfg, input_channels, num_classes)
-        self.seg_model.load_state_dict(torch.load(ckpt_path, map_location='cpu')['model_state'])
-        self.seg_model.cuda()       # run on a single GPU
-        self.seg_model.eval()
 
     @property
     def mode(self):
@@ -223,10 +207,7 @@ class DatasetTemplate(torch_data.Dataset):
             if data_dict.get('gt_boxes', None) is not None:
                 points = data_dict['points']
                 gt_boxes = data_dict['gt_boxes']
-                if self.use_predicted_semantics:
-                    sem_labels, inst_labels = self.predict_semantic_and_instance(points)
-                else:
-                    sem_labels, inst_labels = self.assign_point_labels(points, gt_boxes)
+                sem_labels, inst_labels = self.assign_point_labels(points, gt_boxes)
                 num_classes = len(self.class_names) + 1
                 one_hot_sem = np.zeros((points.shape[0], num_classes), dtype=np.float32)
                 valid = sem_labels > 0
@@ -295,42 +276,6 @@ class DatasetTemplate(torch_data.Dataset):
                 continue
             sem_labels[pts] = gt_classes[box_idx]
             inst_labels[pts] = box_idx + 1
-        return sem_labels, inst_labels
-
-    def predict_semantic_and_instance(pointnet2_model, points, eps=0.5, min_samples=5):
-        """
-        points: (N, 3+C) numpy array
-        pointnet2_model: trained PointNet2Seg
-        Returns:
-            sem_labels:  (N,) int32
-            inst_labels: (N,) int32, 0 = background
-        """
-        pointnet2_model.eval()
-        
-        with torch.no_grad():
-            batch_dict = {
-                'batch_size': 1,
-                'points': torch.from_numpy(np.concatenate([np.zeros((points.shape[0], 1)), points], axis=1)).float().cuda()
-            }
-            out = pointnet2_model(batch_dict)
-            logits = out['logits']  # (N, num_classes)
-            sem_labels = logits.argmax(dim=1).cpu().numpy()
-
-        inst_labels = np.zeros_like(sem_labels, dtype=np.int32)
-        next_inst_id = 1
-        for cls_id in np.unique(sem_labels):
-            if cls_id == 0:
-                continue
-            mask = sem_labels == cls_id
-            pts_cls = points[mask, :3]
-            if pts_cls.shape[0] == 0:
-                continue
-            clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(pts_cls)
-            labels = clustering.labels_
-            labels[labels >= 0] += next_inst_id
-            inst_labels[mask] = labels
-            next_inst_id += labels.max() + 1
-
         return sem_labels, inst_labels
 
     @staticmethod

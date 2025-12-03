@@ -5,6 +5,7 @@ from pcdet.models.backbones_3d.pointnet2_backbone import PointNet2MSG
 class PointNet2Seg(nn.Module):
     def __init__(self, model_cfg, input_channels, num_classes):
         super().__init__()
+        self.num_classes = num_classes
         self.backbone = PointNet2MSG(model_cfg, input_channels=input_channels)
         feat_dim = self.backbone.num_point_features
         self.classifier = nn.Sequential(

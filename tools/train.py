@@ -13,6 +13,7 @@ from tensorboardX import SummaryWriter
 from pcdet.config import cfg, cfg_from_list, cfg_from_yaml_file, log_config_to_file
 from pcdet.datasets import build_dataloader
 from pcdet.models import build_network, model_fn_decorator
+from pcdet.models.pointnet2_seg import PointNet2Seg
 from pcdet.utils import common_utils
 from train_utils.optimization import build_optimizer, build_scheduler
 from train_utils.train_utils import train_model
@@ -134,6 +135,18 @@ def main():
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
     model.cuda()
 
+    seg_model = None
+    if cfg.DATA_CONFIG.get('POINTNET2_SEG', {}).get('ENABLE', False):
+        logger.info("Initializing PointNet2 segmentation model")
+        seg_cfg = cfg.DATA_CONFIG.POINTNET2_SEG.MODEL_CFG
+        seg_ckpt = cfg.DATA_CONFIG.POINTNET2_SEG.CKPT
+        num_classes = cfg.DATA_CONFIG.POINTNET2_SEG.NUM_CLASSES
+        input_channels = 4
+        seg_model = PointNet2Seg(seg_cfg, input_channels, num_classes).cuda()
+        seg_model.load_state_dict(torch.load(seg_ckpt, map_location='cuda')['model_state'])
+        seg_model.eval()
+        logger.info(f"Loaded segmentation model from {seg_ckpt}")
+
     optimizer = build_optimizer(model, cfg.OPTIMIZATION)
 
     # load checkpoint if it is possible
@@ -199,7 +212,8 @@ def main():
         use_logger_to_record=not args.use_tqdm_to_record, 
         show_gpu_stat=not args.wo_gpu_stat,
         use_amp=args.use_amp,
-        cfg=cfg
+        cfg=cfg,
+        seg_model=seg_model
     )
 
     if hasattr(train_set, 'use_shared_memory') and train_set.use_shared_memory:

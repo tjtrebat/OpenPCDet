@@ -5,8 +5,11 @@ import numpy as np
 import torch
 import tqdm
 
+from sklearn.cluster import DBSCAN
+
 from pcdet.models import load_data_to_gpu
 from pcdet.utils import common_utils
+
 
 
 def statistics_info(cfg, ret_dict, metric, disp_dict):
@@ -19,7 +22,7 @@ def statistics_info(cfg, ret_dict, metric, disp_dict):
         '(%d, %d) / %d' % (metric['recall_roi_%s' % str(min_thresh)], metric['recall_rcnn_%s' % str(min_thresh)], metric['gt_num'])
 
 
-def eval_one_epoch(cfg, args, model, dataloader, epoch_id, logger, dist_test=False, result_dir=None):
+def eval_one_epoch(cfg, args, model, dataloader, epoch_id, logger, dist_test=False, result_dir=None, seg_model=None):
     result_dir.mkdir(parents=True, exist_ok=True)
 
     final_output_dir = result_dir / 'final_result' / 'data'
@@ -56,6 +59,20 @@ def eval_one_epoch(cfg, args, model, dataloader, epoch_id, logger, dist_test=Fal
         progress_bar = tqdm.tqdm(total=len(dataloader), leave=True, desc='eval', dynamic_ncols=True)
     start_time = time.time()
     for i, batch_dict in enumerate(dataloader):
+        if seg_model is not None:
+            N = batch_dict['points'].shape[0]
+            sem_labels = np.zeros(N, dtype=np.int32)
+            inst_labels = np.zeros(N, dtype=np.int32)
+            for batch_idx in np.unique(batch_dict['points'][:, 0]):
+                mask = batch_dict['points'][:, 0] == batch_idx
+                points = batch_dict['points'][mask, 1:5]
+                sem_labels[mask], inst_labels[mask] = predict_semantic_and_instance(seg_model, points)
+            num_classes = seg_model.num_classes
+            one_hot_sem = np.zeros((N, num_classes), dtype=np.float32)
+            valid = (sem_labels > 0) & (sem_labels <= num_classes)
+            one_hot_sem[valid, sem_labels[valid]] = 1.0
+            one_hot_sem[~valid, 0] = 1.0
+            batch_dict['points'] = np.concatenate([batch_dict['points'][:, :5], one_hot_sem, inst_labels[:, None]], axis=1)        
         load_data_to_gpu(batch_dict)
 
         if getattr(args, 'infer_time', False):
@@ -135,6 +152,41 @@ def eval_one_epoch(cfg, args, model, dataloader, epoch_id, logger, dist_test=Fal
     logger.info('****************Evaluation done.*****************')
     return ret_dict
 
+
+def predict_semantic_and_instance(seg_model, points, eps=0.5, min_samples=5):
+    """
+    points: (N, 3+C) numpy array
+    pointnet2_model: trained PointNet2Seg
+    Returns:
+        sem_labels:  (N,) int32
+        inst_labels: (N,) int32, 0 = background
+    """
+    
+    with torch.no_grad():
+        batch_dict = {
+            'batch_size': 1,
+            'points': torch.from_numpy(np.concatenate([np.zeros((points.shape[0], 1)), points], axis=1)).float().cuda()
+        }
+        out = seg_model(batch_dict)
+        logits = out['logits']  # (N, num_classes)
+        sem_labels = logits.argmax(dim=1).cpu().numpy()
+
+    inst_labels = np.zeros_like(sem_labels, dtype=np.int32)
+    next_inst_id = 1
+    for cls_id in np.unique(sem_labels):
+        if cls_id == 0:
+            continue
+        mask = sem_labels == cls_id
+        pts_cls = points[mask, :3]
+        if pts_cls.shape[0] == 0:
+            continue
+        clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(pts_cls)
+        labels = clustering.labels_
+        labels[labels >= 0] += next_inst_id
+        inst_labels[mask] = labels
+        next_inst_id += labels.max() + 1
+
+    return sem_labels, inst_labels
 
 if __name__ == '__main__':
     pass

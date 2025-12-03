@@ -4,14 +4,17 @@ import torch
 import tqdm
 import time
 import glob
+import numpy as np
+
 from torch.nn.utils import clip_grad_norm_
 from pcdet.utils import common_utils, commu_utils
+from sklearn.cluster import DBSCAN
 
 
 def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, accumulated_iter, optim_cfg,
                     rank, tbar, total_it_each_epoch, dataloader_iter, tb_log=None, leave_pbar=False, 
                     use_logger_to_record=False, logger=None, logger_iter_interval=50, cur_epoch=None, 
-                    total_epochs=None, ckpt_save_dir=None, ckpt_save_time_interval=300, show_gpu_stat=False, use_amp=False):
+                    total_epochs=None, ckpt_save_dir=None, ckpt_save_time_interval=300, show_gpu_stat=False, use_amp=False, seg_model=None):
     if total_it_each_epoch == len(train_loader):
         dataloader_iter = iter(train_loader)
 
@@ -53,6 +56,20 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
         optimizer.zero_grad()
 
         with torch.cuda.amp.autocast(enabled=use_amp):
+            if seg_model is not None:
+                N = batch['points'].shape[0]
+                sem_labels = np.zeros(N, dtype=np.int32)
+                inst_labels = np.zeros(N, dtype=np.int32)
+                for batch_idx in np.unique(batch['points'][:, 0]):
+                    mask = batch['points'][:, 0] == batch_idx
+                    points = batch['points'][mask, 1:5]
+                    sem_labels[mask], inst_labels[mask] = predict_semantic_and_instance(seg_model, points)
+                num_classes = seg_model.num_classes
+                one_hot_sem = np.zeros((N, num_classes), dtype=np.float32)
+                valid = (sem_labels > 0) & (sem_labels <= num_classes)
+                one_hot_sem[valid, sem_labels[valid]] = 1.0
+                one_hot_sem[~valid, 0] = 1.0
+                batch['points'] = np.concatenate([batch['points'][:, :5], one_hot_sem, inst_labels[:, None]], axis=1)
             loss, tb_dict, disp_dict = model_func(model, batch)
 
         scaler.scale(loss).backward()
@@ -146,12 +163,47 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
         pbar.close()
     return accumulated_iter
 
+def predict_semantic_and_instance(seg_model, points, eps=0.5, min_samples=5):
+    """
+    points: (N, 3+C) numpy array
+    pointnet2_model: trained PointNet2Seg
+    Returns:
+        sem_labels:  (N,) int32
+        inst_labels: (N,) int32, 0 = background
+    """
+    
+    with torch.no_grad():
+        batch_dict = {
+            'batch_size': 1,
+            'points': torch.from_numpy(np.concatenate([np.zeros((points.shape[0], 1)), points], axis=1)).float().cuda()
+        }
+        out = seg_model(batch_dict)
+        logits = out['logits']  # (N, num_classes)
+        sem_labels = logits.argmax(dim=1).cpu().numpy()
+
+    inst_labels = np.zeros_like(sem_labels, dtype=np.int32)
+    next_inst_id = 1
+    for cls_id in np.unique(sem_labels):
+        if cls_id == 0:
+            continue
+        mask = sem_labels == cls_id
+        pts_cls = points[mask, :3]
+        if pts_cls.shape[0] == 0:
+            continue
+        clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(pts_cls)
+        labels = clustering.labels_
+        labels[labels >= 0] += next_inst_id
+        inst_labels[mask] = labels
+        next_inst_id += labels.max() + 1
+
+    return sem_labels, inst_labels
+
 
 def train_model(model, optimizer, train_loader, model_func, lr_scheduler, optim_cfg,
                 start_epoch, total_epochs, start_iter, rank, tb_log, ckpt_save_dir, train_sampler=None,
                 lr_warmup_scheduler=None, ckpt_save_interval=1, max_ckpt_save_num=50,
                 merge_all_iters_to_one_epoch=False, use_amp=False,
-                use_logger_to_record=False, logger=None, logger_iter_interval=None, ckpt_save_time_interval=None, show_gpu_stat=False, cfg=None):
+                use_logger_to_record=False, logger=None, logger_iter_interval=None, ckpt_save_time_interval=None, show_gpu_stat=False, cfg=None, seg_model=None):
     accumulated_iter = start_iter
 
     # use for disable data augmentation hook
@@ -191,7 +243,8 @@ def train_model(model, optimizer, train_loader, model_func, lr_scheduler, optim_
                 logger=logger, logger_iter_interval=logger_iter_interval,
                 ckpt_save_dir=ckpt_save_dir, ckpt_save_time_interval=ckpt_save_time_interval, 
                 show_gpu_stat=show_gpu_stat,
-                use_amp=use_amp
+                use_amp=use_amp,
+                seg_model=seg_model
             )
 
             # save trained model
